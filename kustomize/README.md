@@ -27,6 +27,7 @@ Strategic merge patching uses JSON/YAML merge semantics. This approach merges th
 #### Patch Logic
 
 When Kustomize applies a strategic merge patch:
+
 - Any existing fields in the base that are not addressed by the patch remain untouched
 - New fields from the patch get added to the base configuration
 - Existing fields are overwritten by the patch's values

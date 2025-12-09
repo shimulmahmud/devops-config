@@ -1,0 +1,158 @@
+on:
+  push:
+    branches:
+      - develop
+      - master
+      - staging
+
+name: Build & Push Docker Image, GitOps and Slack Notification
+
+jobs:
+  build:
+    name: Build, GitOps and Slack Notification
+    runs-on: ubuntu-latest
+
+    env:
+      ST_ECR_REPOSITORY: ${{ vars.ST_ECR_REPOSITORY }}
+      ST_CICD_USER: ${{ vars.ST_CICD_USER }}
+      ST_CICD_TOKEN: ${{ secrets.ST_CICD_TOKEN }}
+      ST_AWS_ACCESS_KEY_ID: ${{ vars.ST_AWS_ACCESS_KEY_ID }}
+      ST_AWS_SECRET_ACCESS_KEY: ${{ secrets.ST_AWS_SECRET_ACCESS_KEY }}
+      ST_AWS_REGION: ${{ vars.ST_AWS_REGION }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ env.ST_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.ST_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.ST_AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        run: |
+          set -e
+          declare -A branches=( 
+            ["refs/heads/develop"]="development"
+            ["refs/heads/staging"]="staging"
+            ["refs/heads/master"]="production"
+          )
+
+          PROJECTS=("coupon")
+
+          for branch in "${!branches[@]}"; do
+            if [ "${GITHUB_REF}" == "$branch" ]; then
+              ENVIRONMENT=${branches[$branch]}
+              break
+            fi
+          done
+
+          for PROJECT in "${PROJECTS[@]}"; do
+            ECR_REPO="${ST_ECR_REPOSITORY}/${ENVIRONMENT}/${PROJECT}"
+
+            if ! aws ecr describe-repositories --repository-names "${ENVIRONMENT}/${PROJECT}" > /dev/null 2>&1; then
+              aws ecr create-repository --repository-name "${ENVIRONMENT}/${PROJECT}"
+            fi
+
+            docker build -t $ECR_REPO:${{ github.sha }} -f Dockerfile.${ENVIRONMENT} .
+            docker tag $ECR_REPO:${{ github.sha }} $ECR_REPO:${{ github.sha }}
+            docker push $ECR_REPO:${{ github.sha }}
+            echo "image=$ECR_REPO:${{ github.sha }}" >>$GITHUB_OUTPUT
+          done
+
+      - name: Update GitOps repository
+        id: gitops
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -e
+
+          # Variables
+          REPO_URL="https://$ST_CICD_USER:$ST_CICD_TOKEN@github.com/sharetripnet/gitops-development.git"
+          CLONE_DIR="gitops-development"
+
+          declare -A branches=( 
+            ["refs/heads/develop"]="development"
+            ["refs/heads/staging"]="staging"
+            ["refs/heads/master"]="production"
+          )
+
+          for branch in "${!branches[@]}"; do
+            if [ "${GITHUB_REF}" == "$branch" ]; then
+              ENVIRONMENT=${branches[$branch]}
+              case ${ENVIRONMENT} in
+                development) REPO_URL="https://$ST_CICD_USER:$ST_CICD_TOKEN@github.com/sharetripnet/gitops-development.git" ;;
+                staging) REPO_URL="https://$ST_CICD_USER:$ST_CICD_TOKEN@github.com/sharetripnet/gitops-staging.git" ;;
+                production) REPO_URL="https://$ST_CICD_USER:$ST_CICD_TOKEN@github.com/sharetripnet/cicd.git" ;;
+              esac
+              CLONE_DIR="gitops-${ENVIRONMENT}"
+              break
+            fi
+          done
+
+          PROJECTS=("coupon")
+
+          # Clone the repository
+          if git clone "$REPO_URL" "$CLONE_DIR"; then
+              echo "Repository cloned successfully."
+          else
+              echo "Failed to clone the repository. Please check the repository URL and credentials."
+              exit 1
+          fi
+
+          # Navigate to the cloned repository
+          cd ${CLONE_DIR}
+
+          # Define directories to process
+          if [ "${GITHUB_REF}" == "refs/heads/master" ]; then
+            declare -a dirs=("production/applications")
+          else
+            declare -a dirs=("applications")
+          fi
+
+          for dir in "${dirs[@]}"; do
+            for PROJECT in "${PROJECTS[@]}"; do
+              cd ${dir}/${PROJECT}
+              curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+              chmod +x kustomize
+              kustomize edit set image ${PROJECT}=$ST_ECR_REPOSITORY/${ENVIRONMENT}/${PROJECT}:${IMAGE_TAG}
+              rm -rf kustomize
+              cd - > /dev/null
+            done
+          done
+
+          # Check for changes and commit if any
+          if [ $(git status --porcelain | wc -l) -eq "0" ]; then
+            git diff
+            git status
+            echo "🟢 Git repo is clean."
+          else
+            git config --global user.email "github-action@github.com"
+            git config --global user.name "Github-Action Pipeline"
+            git add .
+            git commit -am "[Github] updating ${ENVIRONMENT} images to ${IMAGE_TAG}"
+            git pull --ff-only
+            git push origin main
+          fi
+
+      - name: BACKUP CODE to AWS CODE-COMMIT
+        uses: pixta-dev/repository-mirroring-action@v1
+        if: github.ref == 'refs/heads/master'
+        with:
+          target_repo_url: ssh://git-codecommit.us-east-1.amazonaws.com/v1/repos/sharetrip-coupon
+          ssh_private_key: ${{ secrets.CODECOMMITSSHKEY }}
+          ssh_username: ${{ secrets.CODECOMMITSSHKEYID }}
+
+      - uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()

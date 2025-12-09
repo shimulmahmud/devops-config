@@ -1,0 +1,221 @@
+name: Unified CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - dev
+      - master
+      - develop
+
+jobs:
+  deploy-to-dev:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      ## Step 1
+      - uses: actions/checkout@v3
+      ## Step 2
+      - name: Deploy to Server
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          port: ${{ secrets.PORT }}
+          key: ${{ secrets.SSHKEY_PRIVATE }}
+          script: |
+            cd /var/web/html_new/dev-sudo/wallet-b-dpay-sudo
+            sudo chown -Rf nginx:dpay /var/web/html_new/dev-sudo/wallet-b-dpay-sudo
+            sudo chmod -Rf 770 /var/web/html_new/dev-sudo/wallet-b-dpay-sudo
+            sudo chmod -Rf g+s /var/web/html_new/dev-sudo/wallet-b-dpay-sudo
+            sudo chmod +x scripts/sudo_script.sh
+            sudo ./scripts/sudo_script.sh
+
+  deploy-to-develop:
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project: [wallet-b-dpay-sudo]
+        project-short: [sudo]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "7.4"
+      - name: Build Application
+        run: |
+          rm -rf .git
+          composer install --no-dev --optimize-autoloader
+          composer require predis/predis
+          npm install
+          zip -r ${{ matrix.project }}-${{ github.sha }}.zip . && echo "Zip operation completed successfully" || echo "Zip operation failed"
+      - name: copy file via ssh password
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.HOST_STPAY_DEV }}
+          username: ${{ secrets.USERNAME_STPAY_DEV }}
+          key: ${{ secrets.SSHKEY_PRIVATE_STPAY_DEV }}
+          port: ${{ secrets.PORT_STPAY_DEV }}
+          source: "${{ matrix.project }}-${{ github.sha }}.zip"
+          target: "/home/ec2-user/apps/${{ matrix.project }}"
+
+      - name: executing remote ssh commands
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.HOST_STPAY_DEV }}
+          username: ${{ secrets.USERNAME_STPAY_DEV }}
+          key: ${{ secrets.SSHKEY_PRIVATE_STPAY_DEV }}
+          port: ${{ secrets.PORT_STPAY_DEV }}
+          script: |
+            mkdir -p /home/ec2-user/apps/${{ matrix.project }}
+            cd /home/ec2-user/apps/${{ matrix.project }}
+            rm -fr ${{ matrix.project-short }}
+            mkdir ${{ matrix.project-short }}
+            unzip ${{ matrix.project }}-${{ github.sha }}.zip -d /home/ec2-user/apps/${{ matrix.project }}/${{ matrix.project-short }}
+            cp /home/ec2-user/env/${{ matrix.project-short }}/.env /home/ec2-user/apps/${{ matrix.project }}/${{ matrix.project-short }}
+            sudo mkdir -p /var/web/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}
+            sudo cp -Rf /home/ec2-user/apps/${{ matrix.project }}/${{ matrix.project-short }}/. /var/web/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}
+            rm /home/ec2-user/apps/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}.zip
+            cd /var/web/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}
+            sudo php81 artisan optimize:clear
+            sudo php81 artisan queue:restart
+            sudo chown -Rf nginx:dpay /var/web/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}
+            sudo chmod -Rf 770 /var/web/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}
+            sudo chmod -Rf g+s /var/web/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}
+            sudo chmod -R 777 storage
+            sudo chmod -R 777 bootstrap/cache
+            sudo ls -td /var/web/${{ matrix.project }}/* | tail -n +3 | xargs sudo rm -fr
+            sudo sed -i "s|^\s*root\s*/var/web/${{ matrix.project }}/${{ matrix.project }}-[a-zA-Z0-9]*/public;|root /var/web/${{ matrix.project }}/${{ matrix.project }}-${{ github.sha }}/public;|g" "/etc/nginx/conf.d/${{ matrix.project }}.conf"
+            sudo systemctl restart nginx
+            echo "Application deployed!"
+
+  deploy-to-prod:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1.10"
+      - name: Build Application
+        run: |
+          rm -rf .git
+          composer install --no-dev --optimize-autoloader
+          npm install
+          zip -r wallet-b-dpay-sudo-${{ github.sha }}.zip . && echo "Zip operation completed successfully" || echo "Zip operation failed"
+
+      - name: copy file via ssh password
+        uses: appleboy/scp-action@v0.1.4
+        with:
+          host: ${{ secrets.HOST_MISC }}
+          username: ${{ secrets.USERNAME_MISC_JENK }}
+          key: ${{ secrets.SSHKEY_PRIVATE_JENK }}
+          port: ${{ secrets.PORT_MISC }}
+          source: "wallet-b-dpay-sudo-${{ github.sha }}.zip"
+          target: "/home/jenkins/git_action_files/wallet-b-dpay-sudo"
+
+      - name: Run scp script to App servers
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_MISC }}
+          username: ${{ secrets.USERNAME_MISC_JENK }}
+          key: ${{ secrets.SSHKEY_PRIVATE_JENK }}
+          port: ${{ secrets.PORT_MISC }}
+          script: |
+            rm -fr unzipsudo
+            mkdir unzipsudo
+            cd /home/jenkins/git_action_files/wallet-b-dpay-sudo
+            unzip wallet-b-dpay-sudo-${{ github.sha }}.zip -d /home/jenkins/unzipsudo
+            scp /home/jenkins/env/sudo/.env /home/jenkins/unzipsudo
+            scp -r /home/jenkins/unzipsudo/ ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_1 }}:/home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}
+            scp -r /home/jenkins/unzipsudo/ ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_2 }}:/home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}
+            scp -r /home/jenkins/unzipsudo/ ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_3 }}:/home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}
+            # scp -r /home/jenkins/unzipsudo/ ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_4 }}:/home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}
+
+      - name: Run scp script to deploy App1 servers
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_MISC }}
+          username: ${{ secrets.USERNAME_MISC_JENK }}
+          key: ${{ secrets.SSHKEY_PRIVATE_JENK }}
+          port: ${{ secrets.PORT_MISC }}
+          script: |
+            ssh ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_1 }} \
+            "sudo rsync -av /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}/ /var/web/html_new/sudo/apigw-sudo-prod && \
+             rm -fr /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }} && \
+             cd /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -R 777 storage && \
+             sudo chmod -R 777 bootstrap/cache && \
+             sudo php81 artisan config:cache && \
+             sudo php81 artisan cache:clear && \
+             sudo php81 artisan config:clear && \
+             sudo php81 artisan queue:restart && \
+             sudo chown -Rf nginx:dpay /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -Rf 770 /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -Rf g+s /var/web/html_new/sudo/apigw-sudo-prod"
+      - name: Run scp script to deploy App2 servers
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_MISC }}
+          username: ${{ secrets.USERNAME_MISC_JENK }}
+          key: ${{ secrets.SSHKEY_PRIVATE_JENK }}
+          port: ${{ secrets.PORT_MISC }}
+          script: |
+            ssh ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_2 }} \
+            "sudo rsync -av /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}/ /var/web/html_new/sudo/apigw-sudo-prod && \
+             rm -fr /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }} && \
+             cd /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -R 777 storage && \
+             sudo chmod -R 777 bootstrap/cache && \
+             sudo php81 artisan config:cache && \
+             sudo php81 artisan cache:clear && \
+             sudo php81 artisan config:clear && \
+             sudo php81 artisan queue:restart && \
+             sudo chown -Rf nginx:dpay /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -Rf 770 /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -Rf g+s /var/web/html_new/sudo/apigw-sudo-prod"
+      - name: Run scp script to deploy App3 servers
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_MISC }}
+          username: ${{ secrets.USERNAME_MISC_JENK }}
+          key: ${{ secrets.SSHKEY_PRIVATE_JENK }}
+          port: ${{ secrets.PORT_MISC }}
+          script: |
+            ssh ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_3 }} \
+            "sudo rsync -av /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}/ /var/web/html_new/sudo/apigw-sudo-prod && \
+             rm -fr /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }} && \
+             cd /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -R 777 storage && \
+             sudo chmod -R 777 bootstrap/cache && \
+             sudo php81 artisan config:cache && \
+             sudo php81 artisan cache:clear && \
+             sudo php81 artisan config:clear && \
+             sudo php81 artisan queue:restart && \
+             sudo chown -Rf nginx:dpay /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -Rf 770 /var/web/html_new/sudo/apigw-sudo-prod && \
+             sudo chmod -Rf g+s /var/web/html_new/sudo/apigw-sudo-prod"
+
+      # - name: Run scp script to deploy App4 servers
+      #   uses: appleboy/ssh-action@master
+      #   with:
+      #     host: ${{ secrets.HOST_MISC }}
+      #     username: ${{ secrets.USERNAME_MISC_JENK }}
+      #     key: ${{ secrets.SSHKEY_PRIVATE_JENK }}
+      #     port: ${{ secrets.PORT_MISC }}
+      #     script: |
+      #       ssh ${{ secrets.USERNAME_MISC_JENK }}@${{ secrets.APP_4 }} \
+      #       "sudo rsync -av /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }}/ /var/web/html_new/sudo/apigw-sudo-prod && \
+      #        rm -fr /home/jenkins/apigw-sudo/apigw-sudo-${{ github.sha }} && \
+      #        cd /var/web/html_new/sudo/apigw-sudo-prod && \
+      #        sudo chmod -R 777 storage && \
+      #        sudo chmod -R 777 bootstrap/cache && \
+      #        sudo php81 artisan config:cache && \
+      #        sudo php81 artisan cache:clear && \
+      #        sudo php81 artisan config:clear && \
+      #        sudo php81 artisan queue:restart && \
+      #        sudo chown -Rf nginx:dpay /var/web/html_new/sudo/apigw-sudo-prod && \
+      #        sudo chmod -Rf 770 /var/web/html_new/sudo/apigw-sudo-prod && \
+      # sudo chmod -Rf g+s /var/web/html_new/sudo/apigw-sudo-prod"
